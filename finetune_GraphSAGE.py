@@ -2,6 +2,7 @@
 """
 Fine-tune pretrained GraphSAGE on DL-domain nodes
 while masking out OSM nodes during loss computation.
+Now includes reproducible train/val/test splits and hold-out evaluation.
 """
 
 import os
@@ -13,7 +14,6 @@ from tqdm import tqdm
 from models import GraphSAGE
 from config import CONFIG
 from tune_and_eval_dist_v3 import build_knn_graph, build_neighbor_loaders, evaluate_minibatch
-
 
 # =====================================================
 # Configuration and device
@@ -37,10 +37,13 @@ BATCH_SIZE = CONFIG["batch_size"]
 KNN_K = CONFIG["knn_k"]
 FREEZE = CONFIG.get("fine_tune_freeze_layers", False)
 
+SPLIT_DIR = os.path.join(os.path.dirname(DATA_PATH), "splits")
+os.makedirs(SPLIT_DIR, exist_ok=True)
+
 # =====================================================
 # Load dataset
 # =====================================================
-df = pd.read_csv(DATA_PATH)
+df = pd.read_csv(DATA_PATH, low_memory=False)
 df["label"] = df["label"].fillna(-1).astype(int)
 
 mask_labeled = df["label"] != -1
@@ -54,16 +57,38 @@ y = df["label"].values.astype(int)
 data = build_knn_graph(X, coords, y, k=KNN_K).to(DEVICE)
 
 # =====================================================
-# Define DL-domain train/val split
+# Train / Val / Test Split (reproducible)
 # =====================================================
-labeled_idx = np.where(mask_dl_labeled)[0]
-np.random.shuffle(labeled_idx)
-n = len(labeled_idx)
-train_idx = labeled_idx[:int(0.9 * n)]
-val_idx = labeled_idx[int(0.9 * n):]
+train_file = os.path.join(SPLIT_DIR, "dl_train_idx.csv")
+val_file = os.path.join(SPLIT_DIR, "dl_val_idx.csv")
+test_file = os.path.join(SPLIT_DIR, "combined_test_idx.csv")
 
-train_loader, val_loader, _ = build_neighbor_loaders(
-    data, train_idx, val_idx, val_idx,
+if all(os.path.exists(f) for f in [train_file, val_file, test_file]):
+    train_idx = np.loadtxt(train_file, dtype=int)
+    val_idx = np.loadtxt(val_file, dtype=int)
+    test_idx = np.loadtxt(test_file, dtype=int)
+    print("Loaded existing DL-domain + OSM test split.")
+else:
+    # Only DL-labeled samples for training/validation
+    labeled_idx_dl = np.where(mask_dl_labeled)[0]
+    np.random.seed(42)
+    np.random.shuffle(labeled_idx_dl)
+    n = len(labeled_idx_dl)
+    train_idx = labeled_idx_dl[:int(0.8 * n)]
+    val_idx = labeled_idx_dl[int(0.8 * n):int(0.9 * n)]
+
+    # Include *all labeled* nodes (DL + OSM) in the test set for full evaluation
+    labeled_idx_all = np.where(mask_labeled)[0]
+    test_idx = np.setdiff1d(labeled_idx_all, np.concatenate([train_idx, val_idx]))
+
+    np.savetxt(train_file, train_idx, fmt="%d")
+    np.savetxt(val_file, val_idx, fmt="%d")
+    np.savetxt(test_file, test_idx, fmt="%d")
+    print("Generated and saved new DL-domain train/val and combined-domain test splits.")
+
+
+train_loader, val_loader, test_loader = build_neighbor_loaders(
+    data, train_idx, val_idx, test_idx,
     num_layers=NUM_LAYERS,
     batch_size=BATCH_SIZE,
     num_neighbors_each_layer=CONFIG["num_neighbors_default"]
@@ -82,12 +107,24 @@ model = GraphSAGE(
 model.load_state_dict(torch.load(PRETRAINED_PATH, map_location=DEVICE))
 print(f"Loaded pretrained model from {PRETRAINED_PATH}")
 
-if FREEZE:
-    # Freeze all layers except the final one for stable domain adaptation
+# --- Optional freezing control ---
+FREEZE = CONFIG.get("fine_tune_freeze_layers", False)
+FREEZE_DEPTH = CONFIG.get("fine_tune_freeze_depth", 0)
+
+if FREEZE and FREEZE_DEPTH > 0:
+    frozen = 0
     for name, param in model.named_parameters():
-        if "lin_layers" not in name:
+        # Freeze bottom layers up to the chosen depth
+        if any(f"convs.{i}." in name for i in range(FREEZE_DEPTH)):
             param.requires_grad = False
-    print("Froze lower layers for fine-tuning.")
+            frozen += 1
+    print(f"Froze {FREEZE_DEPTH} bottom GraphSAGE layer(s) "
+          f"({frozen} parameter groups).")
+elif FREEZE:
+    print("fine_tune_freeze_layers=True but fine_tune_freeze_depth=0 — nothing frozen.")
+else:
+    print("No layers frozen; full model fine-tuning.")
+
 
 # =====================================================
 # Fine-tuning loop
@@ -130,6 +167,43 @@ if best_state:
 torch.save(model.state_dict(), OUT_MODEL_PATH)
 print(f"Saved fine-tuned model → {OUT_MODEL_PATH}")
 
-metrics = pd.DataFrame([{"precision_val": p_val, "recall_val": r_val, "f1_val": best_f1}])
+# =====================================================
+# Final hold-out evaluation (domain-specific)
+# =====================================================
+
+def evaluate_masked(model, df, data, mask, name):
+    """Evaluate model on a masked subset of labeled nodes."""
+    idx = np.where(mask)[0]
+    if len(idx) == 0:
+        print(f"[WARN] No nodes found for {name} evaluation.")
+        return np.nan, np.nan, np.nan
+
+    loader, _, _ = build_neighbor_loaders(
+        data, idx, [], [],
+        num_layers=NUM_LAYERS,
+        batch_size=BATCH_SIZE,
+        num_neighbors_each_layer=CONFIG["num_neighbors_default"]
+    )
+    p, r, f = evaluate_minibatch(model, loader, DEVICE)
+    print(f"{name} → P={p:.4f}, R={r:.4f}, F1={f:.4f}")
+    return p, r, f
+
+# --- Define masks for labeled subsets ---
+mask_osm_labeled = mask_labeled & mask_osm
+mask_dl_labeled  = mask_labeled & (~mask_osm)
+mask_all_labeled = mask_labeled
+
+# --- Run evaluations ---
+p_osm, r_osm, f_osm = evaluate_masked(model, df, data, mask_osm_labeled, "OSM-only")
+p_dl,  r_dl,  f_dl  = evaluate_masked(model, df, data, mask_dl_labeled,  "DL-only")
+p_all, r_all, f_all = evaluate_masked(model, df, data, mask_all_labeled, "All labeled")
+
+# --- Save metrics ---
+metrics = pd.DataFrame([{
+    "precision_val": p_val, "recall_val": r_val, "f1_val": best_f1,
+    "precision_osm": p_osm, "recall_osm": r_osm, "f1_osm": f_osm,
+    "precision_dl":  p_dl,  "recall_dl":  r_dl,  "f1_dl":  f_dl,
+    "precision_all": p_all, "recall_all": r_all, "f1_all": f_all
+}])
 metrics.to_csv(OUT_METRICS_CSV, index=False)
-print(f"Saved validation metrics → {OUT_METRICS_CSV}")
+print(f"\nSaved full domain metrics → {OUT_METRICS_CSV}")

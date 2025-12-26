@@ -25,8 +25,8 @@ with open(job_file, "w") as fh:
     fh.writelines("#SBATCH -N 1\n")
     fh.writelines("#SBATCH --ntasks=1\n")
     fh.writelines("#SBATCH --cpus-per-task=16\n")
-    fh.writelines("#SBATCH -p rtx\n")
-    fh.writelines("#SBATCH -A TG-NAIRR240088\n")
+    fh.writelines("#SBATCH -p gpu-a100\n")
+    fh.writelines("#SBATCH -A DPP20001\n")
     fh.writelines("#SBATCH -t 10:00:00\n\n")
 
 

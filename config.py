@@ -4,13 +4,13 @@ CONFIG = {
     # =====================================================
     # General metadata
     # =====================================================
-    "run_name": "Finetune_GraphSAGE",
+    "run_name": "inference",
     "seed": 42,
 
     # =====================================================
     # Data and I/O paths
     # =====================================================
-    "data_path": "/work2/08968/eliasm1/frontera/GNN/data/OSM_HABITAT_building_node_features_with_admin.csv",
+    "data_path": "/work2/08968/eliasm1/frontera/GNN/data/All_OSM_HABITAT_building_node_features.csv",
     "output_model_path": "/work2/08968/eliasm1/frontera/GNN/models",
     "output_results_path": "/work2/08968/eliasm1/frontera/GNN/results",
     "split_path": "/work2/08968/eliasm1/frontera/GNN/results/splits_GraphSAGE.npz",
@@ -90,18 +90,20 @@ CONFIG = {
 
     # Best hyperparameters from tuning (used for fine-tuning)
     "fine_tune_params": {
-        "hidden_dim": 64,
-        "num_layers": 3,
+        "hidden_dim": 128,
+        "num_layers": 4,
         "dropout": 0.3,
         "lr": 1e-4
     },
 
     # Fine-tuning control
-    "fine_tune_epochs": 100,
+    "fine_tune_epochs": 50,
     "fine_tune_patience": 15,
 
     # Optionally freeze lower layers for domain transfer
     "fine_tune_freeze_layers": False,
+    "fine_tune_freeze_depth": 3,
+
 
     # =====================================================
     # Optional experiment notes / provenance

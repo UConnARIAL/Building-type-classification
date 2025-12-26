@@ -26,14 +26,14 @@ with open(job_file, "w") as fh:
     fh.writelines("#SBATCH --ntasks=1\n")
     fh.writelines("#SBATCH --cpus-per-task=16\n")
     fh.writelines("#SBATCH -p rtx\n")
-    fh.writelines("#SBATCH -A DPP20001\n")
+    fh.writelines("#SBATCH -A TG-NAIRR240088\n")
     fh.writelines("#SBATCH -t 10:00:00\n\n")
 
 
     fh.writelines("echo \"Starting job on $(hostname) at $(date)\"\n")
     fh.writelines("echo \"CUDA devices visible: $CUDA_VISIBLE_DEVICES\"\n\n")
 
-    fh.writelines("srun python finetune_GraphSAGE.py\n\n")
+    fh.writelines("srun python tune_and_eval_dist_v3.py\n\n")
     fh.writelines("echo \"Finished at $(date)\"\n")
 
 os.system(f"sbatch {job_file}")

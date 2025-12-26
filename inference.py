@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Inference script for dual GraphSAGE models:
-- Uses OSM-trained model for 'OSM' nodes
-- Uses DL-finetuned model for 'HABITAT' nodes
-- Adds binary 'Value' predictions (0/1) to CSV
-- Exports shapefile of predicted points
+Dual GraphSAGE inference script (domain-isolated)
+-------------------------------------------------
+- Builds separate graphs for OSM and HABITAT nodes
+- Applies each trained model to its own domain
+- Writes both probability and binary Value outputs
+- Exports shapefile with EPSG:3995 coordinates
 
 Author: Elias Manos
 """
@@ -20,11 +21,11 @@ import geopandas as gpd
 from config import CONFIG
 from models import GraphSAGE
 from graph_utils import build_knn_graph
-from tune_and_eval_dist_v3 import build_neighbor_loaders
+from torch_geometric.loader import NeighborLoader  # <-- use directly
 
 
 # =====================================================
-# Configuration and device
+# Configuration / device
 # =====================================================
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 torch.set_grad_enabled(False)
@@ -36,17 +37,22 @@ SPATIAL_COLS = CONFIG["spatial_cols"]
 OSM_MODEL_PATH = CONFIG["fine_tune_pretrained_path"]
 DL_MODEL_PATH = CONFIG["fine_tune_model_path"]
 
-OUT_CSV = os.path.join(CONFIG["output_results_path"], "inference_OSM_HABITAT_predictions.csv")
-OUT_SHP = os.path.join(CONFIG["output_results_path"], "inference_OSM_HABITAT_predictions.shp")
+OUT_DIR = CONFIG["output_results_path"]
+OUT_CSV = os.path.join(OUT_DIR, "inference_OSM_HABITAT_predictions.csv")
+OUT_SHP = os.path.join(OUT_DIR, "inference_OSM_HABITAT_predictions.shp")
 
 params = CONFIG["fine_tune_params"]
 HIDDEN_DIM = params["hidden_dim"]
 NUM_LAYERS = params["num_layers"]
 DROPOUT = params["dropout"]
+K = CONFIG["knn_k"]
+BATCH_SIZE = CONFIG["batch_size"]
+NUM_NEIGHBORS = CONFIG["num_neighbors_default"]
+NUM_WORKERS = CONFIG.get("loader_num_workers", 0)
 
 
 # =====================================================
-# Load data
+# Load input data
 # =====================================================
 print(f"Loading data from {DATA_PATH} ...")
 df = pd.read_csv(DATA_PATH, low_memory=False)
@@ -54,99 +60,118 @@ df = pd.read_csv(DATA_PATH, low_memory=False)
 mask_osm = df["Source"].str.upper() == "OSM"
 mask_habitat = df["Source"].str.upper() == "HABITAT"
 
-X = df[FEATURE_COLS].values.astype(np.float32)
-coords = df[SPATIAL_COLS].values.astype(np.float32)
-y_dummy = np.zeros(len(df), dtype=int)
+print(f"OSM nodes: {mask_osm.sum():,} | HABITAT nodes: {mask_habitat.sum():,}")
 
 
 # =====================================================
-# Build shared KNN graph
-# =====================================================
-print("Building KNN graph ...")
-data = build_knn_graph(X, coords, y_dummy, k=CONFIG["knn_k"]).to(DEVICE)
-
-
-# =====================================================
-# Load GraphSAGE models
+# Model loader
 # =====================================================
 def load_model(path):
     model = GraphSAGE(
-        in_channels=X.shape[1],
+        in_channels=len(FEATURE_COLS),
         hidden_dim=HIDDEN_DIM,
         num_layers=NUM_LAYERS,
-        dropout=DROPOUT
+        dropout=DROPOUT,
     ).to(DEVICE)
     state = torch.load(path, map_location=DEVICE)
     model.load_state_dict(state)
     model.eval()
-    print(f"Loaded model from {path}")
+    print(f"Loaded model → {path}")
     return model
 
 
-model_osm = load_model(OSM_MODEL_PATH)
-model_dl = load_model(DL_MODEL_PATH)
+# =====================================================
+# Inference loader builder
+# =====================================================
+def build_inference_loader(data, idx_subset):
+    """Consistent NeighborLoader for inference (no val/test placeholders)."""
+    nodes = torch.tensor(idx_subset, dtype=torch.long)
+    num_neighbors = [NUM_NEIGHBORS] * NUM_LAYERS
+    return NeighborLoader(
+        data,
+        input_nodes=nodes,
+        num_neighbors=num_neighbors,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS
+    )
 
 
 # =====================================================
 # Inference helper
 # =====================================================
-def infer_subset(model, idx_subset, name):
-    """Run binary inference for a given subset of nodes."""
-    if len(idx_subset) == 0:
-        print(f"[WARN] No nodes found for {name}")
-        return np.zeros(0)
-    loader, _, _ = build_neighbor_loaders(
-        data, idx_subset, [], [],
-        num_layers=NUM_LAYERS,
-        batch_size=CONFIG["batch_size"],
-        num_neighbors_each_layer=CONFIG["num_neighbors_default"]
-    )
-    preds = []
+@torch.no_grad()
+def infer_subset(model, X, coords, name):
+    """Run binary + probability inference for one domain subset."""
+    print(f"\nBuilding KNN graph for {name} ({len(X):,} nodes) ...")
+    data = build_knn_graph(X, coords, np.zeros(len(X)), k=K).to(DEVICE)
+
+    loader = build_inference_loader(data, np.arange(len(X)))
+
+    probs_all = []
     for batch in tqdm(loader, desc=f"Inference ({name})", dynamic_ncols=True):
         batch = batch.to(DEVICE)
         logits = model(batch)
         probs = torch.sigmoid(logits[:batch.batch_size])
-        binary = (probs >= 0.5).float()
-        preds.append(binary.cpu().numpy())
-    return np.concatenate(preds)
+        probs_all.append(probs.cpu().numpy())
+
+    probs_all = np.concatenate(probs_all)
+    preds_bin = (probs_all >= 0.5).astype(int)
+    return preds_bin, probs_all
 
 
 # =====================================================
-# Run inference for each domain
+# Load models
 # =====================================================
-idx_osm = np.where(mask_osm.values)[0]
-idx_dl = np.where(mask_habitat.values)[0]
-
-print(f"Running inference on {len(idx_osm)} OSM and {len(idx_dl)} HABITAT nodes ...")
-
-preds_osm = infer_subset(model_osm, idx_osm, "OSM")
-preds_dl = infer_subset(model_dl, idx_dl, "HABITAT")
+model_osm = load_model(OSM_MODEL_PATH)
+model_dl = load_model(DL_MODEL_PATH)
 
 
 # =====================================================
-# Merge predictions and save CSV
+# Prepare subsets
+# =====================================================
+X_osm = df.loc[mask_osm, FEATURE_COLS].values.astype(np.float32)
+coords_osm = df.loc[mask_osm, SPATIAL_COLS].values.astype(np.float32)
+
+X_dl = df.loc[mask_habitat, FEATURE_COLS].values.astype(np.float32)
+coords_dl = df.loc[mask_habitat, SPATIAL_COLS].values.astype(np.float32)
+
+
+# =====================================================
+# Run inference
+# =====================================================
+preds_osm, probs_osm = infer_subset(model_osm, X_osm, coords_osm, "OSM")
+preds_dl, probs_dl = infer_subset(model_dl, X_dl, coords_dl, "HABITAT")
+
+
+# =====================================================
+# Merge results back to master dataframe
 # =====================================================
 Value = np.zeros(len(df), dtype=int)
-Value[idx_osm] = preds_osm
-Value[idx_dl] = preds_dl
+Prob = np.zeros(len(df), dtype=float)
 
-df["Value"] = Value.astype(int)
+Value[mask_osm.values] = preds_osm
+Prob[mask_osm.values] = probs_osm
+
+Value[mask_habitat.values] = preds_dl
+Prob[mask_habitat.values] = probs_dl
+
+df["Value"] = Value
+df["Prob"] = Prob
+
+
+# =====================================================
+# Save CSV + shapefile
+# =====================================================
+os.makedirs(OUT_DIR, exist_ok=True)
 df.to_csv(OUT_CSV, index=False)
+print(f"\n✅ Saved predictions → {OUT_CSV}")
 
-print(f"\nSaved binary inference results → {OUT_CSV}")
-
-
-# =====================================================
-# Export shapefile of predictions
-# =====================================================
-if {"centroid_x", "centroid_y", "Value"}.issubset(df.columns):
-    print("Creating GeoDataFrame and exporting shapefile ...")
+if {"centroid_x", "centroid_y"}.issubset(df.columns):
     gdf = gpd.GeoDataFrame(
         df,
         geometry=[Point(xy) for xy in zip(df["centroid_x"], df["centroid_y"])],
-        crs="EPSG:3995"  # North Pole LAEA projection
+        crs="EPSG:3995"
     )
-    gdf[["centroid_x", "centroid_y", "Value", "geometry"]].to_file(OUT_SHP)
-    print(f"Saved shapefile → {OUT_SHP}")
-else:
-    print("Required columns (centroid_x, centroid_y, Value) not found — shapefile skipped.")
+    gdf[["centroid_x", "centroid_y", "Value", "Prob", "geometry"]].to_file(OUT_SHP)
+    print(f"✅ Saved shapefile → {OUT_SHP}")

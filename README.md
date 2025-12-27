@@ -29,8 +29,9 @@
 
 ## Model finetuning
 1. Noting the model with the best performance, set the path to its weights in ```config.py (line 85)```.
-2. Set paths at which the finetuned model (line 88) and it performance metrics (line 89) will be saved.
-3. Specify the hyperparameters from the best performing model in lines 92-97. For example:
+2. We will now finetune the best model to building footprints predicted by a deep learning model (as opposed to those digitized by humans). In ```config.py (line 13)```, change ```"data_path": "/.../OSM_HABITAT_building_node_features.csv"```, as this file contains the deep learning-derived building footprint nodes along with the OSM building footprint nodes. These deep learning-derived footprints took the place and use type label of overlapping OSM footprints.
+3. Set paths at which the finetuned model (line 88) and it performance metrics (line 89) will be saved.
+4. Specify the hyperparameters from the best performing model in lines 92-97. For example:
    ```
     "fine_tune_params": {
         "hidden_dim": 128,
@@ -39,10 +40,11 @@
         "lr": 1e-4
     },
    ```
-4. Set finetuning options (e.g, epochs, frozen/unfrozen layers) in lines 100-105. Leave the code as is if you want to reproduce the authors' findings.
-5. As done before, edit run_tune_and_eval_dist.py to match specific HPC system requirements. Change filename in line 36 from ```tune_and_eval_dist.py``` to ```finetune_GraphSAGE.py```
+5. Set finetuning options (e.g, epochs, frozen/unfrozen layers) in lines 100-105. Leave the code as is if you want to reproduce the authors' findings.
+6. As done before, edit run_tune_and_eval_dist.py to match specific HPC system requirements. Change filename in line 36 from ```tune_and_eval_dist.py``` to ```finetune_GraphSAGE.py```
   
 ## Classical ML classifier model comparison
 Since the classical ML classifiers used here are much lighter than the GraphCNNs assessed above, this experiment can be (and was) run on a local computer. 
-1. Similar to the previous experiment, adjust the I/O paths in ```classical_models_tune_and_eval.py (lines 40-45)```. This time, set ```"data_path": "/.../OSM_HABITAT_building_node_features.csv"```, as this file contains the deep learning-derived building footprint nodes along with the OSM building footprint nodes. These deep learning-derived footprints took the place and use type label of overlapping OSM footprints.
-2. From your HPC system, download the .npz file that contains the indices used to split the data into train/val/test for the GraphCNN model selection experiment. Set ```"split_path"``` in line 44 to this file. 
+1. Similar to the previous experiment, adjust the I/O paths in ```classical_models_tune_and_eval.py (lines 40-45)```.
+2. From your HPC system, download the .npz file that contains the indices used to split the data into train/val/test for the GraphCNN model selection experiment. Set ```"split_path"``` in line 44 to this file.
+3. Run ```python classical_models_tune_and_eval.py``` to obtain results of classical ML model performance.
